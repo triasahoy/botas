@@ -1,9 +1,3 @@
-Oke, Trias — ini **README.md final** yang sudah lengkap, rapi, dan profesional.  
-Aku gabungkan semua yang kemarin kita susun, plus aku tambahkan **badge** di bagian atas untuk memberi kesan modern dan kredibel.
-
----
-
-```markdown
 # 📈 DCA BTC/IDR Tokocrypto — Modern Dashboard
 
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.32+-FF4B4B?logo=streamlit)](https://streamlit.io)
