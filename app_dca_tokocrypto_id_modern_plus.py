@@ -295,8 +295,9 @@ ohlcv = client.fetch_ohlcv(symbol, "1d", to_ms(start_dt), to_ms(end_dt))
 df = ohlcv_to_df(ohlcv)
 
 # Multi-slippage backtest
-slippage_list = [0.0, 5.0, 10.0]
-window_list = [1, 3, 5]
+slippage_list = [0.0, 5.0, 10.0]  # contoh: 0 bps, 5 bps, 10 bps
+window_list = [1, 3, 5]           # contoh: 1 tahun, 3 tahun, 5 tahun
+
 reports = []
 for slip in slippage_list:
     for win in window_list:
@@ -412,6 +413,7 @@ st.dataframe(pd.DataFrame(bh_results))
 # ---------------------------
 st.markdown("---")
 st.caption("DCA BTC/IDR Tokocrypto — Modern Dashboard © 2025")
+
 
 
 
