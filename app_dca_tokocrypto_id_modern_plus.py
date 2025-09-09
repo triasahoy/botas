@@ -195,10 +195,11 @@ def generate_monthly_schedule(start_dt: datetime, end_dt: datetime, day_of_month
 def run_dca_backtest(df: pd.DataFrame, cfg: StrategyConfig, window_years: int) -> BacktestReport:
     end_dt = df["time"].max()
     start_dt = end_dt - relativedelta(years=window_years)
-    df_window = df[df["time"] >= start_dt].reset_index(drop=True)
+    df_window = df[df["time"] >= start_dt].reset
+        df_window = df[df["time"] >= start_dt].reset_index(drop=True)
     schedule = generate_monthly_schedule(start_dt, end_dt, cfg.buy_day_of_month)
+
     total_invested = 0.0
-    total_btc
     total_btc = 0.0
     fees_paid = 0.0
     equity_curve = []
@@ -294,9 +295,11 @@ start_dt = end_dt - relativedelta(years=5)
 ohlcv = client.fetch_ohlcv(symbol, "1d", to_ms(start_dt), to_ms(end_dt))
 df = ohlcv_to_df(ohlcv)
 
+# ---------------------------
 # Multi-slippage backtest
-slippage_list = [0.0, 5.0, 10.0]  # contoh: 0 bps, 5 bps, 10 bps
-window_list = [1, 3, 5]           # contoh: 1 tahun, 3 tahun, 5 tahun
+# ---------------------------
+slippage_list = [0.0, 5.0, 10.0]
+window_list = [1, 3, 5]
 
 reports = []
 for slip in slippage_list:
@@ -310,7 +313,9 @@ for slip in slippage_list:
         rep = run_dca_backtest(df, cfg_strat, win)
         reports.append(rep)
 
-# Tabel hasil ringkas
+# ---------------------------
+# Tabel hasil ringkasan
+# ---------------------------
 st.subheader("📊 Ringkasan Hasil Backtest")
 
 summary_data = []
@@ -327,10 +332,11 @@ for r in reports:
         "Fee Dibayar": fmt_idr(r.fees_paid_idr)
     })
 
-# Tampilkan tabel ringkasan
 st.dataframe(pd.DataFrame(summary_data))
 
+# ---------------------------
 # Grafik Equity Curve
+# ---------------------------
 st.subheader("📈 Grafik Equity Curve")
 fig = go.Figure()
 for r in reports:
@@ -343,7 +349,9 @@ for r in reports:
 fig.update_layout(template="plotly_dark", height=500, width=900)
 st.plotly_chart(fig, use_container_width=True)
 
-# Ekspor ZIP (✅ sudah fix)
+# ---------------------------
+# Ekspor ZIP
+# ---------------------------
 st.subheader("📦 Ekspor Hasil (ZIP)")
 if st.button("Buat & Unduh ZIP"):
     buffer = io.BytesIO()
@@ -380,9 +388,18 @@ if st.button("Buat & Unduh ZIP"):
         mime="application/zip"
     )
 
+# ---------------------------
 # Benchmark Buy & Hold
+# ---------------------------
 st.subheader("📏 Benchmark Buy & Hold")
-sell_fee_rate = st.number_input("Biaya jual (%)", min_value=0.0, max_value=5.0, value=0.15, step=0.05) / 100
+sell_fee_rate = st.number_input(
+    "Biaya jual (%)",
+    min_value=0.0,
+    max_value=5.0,
+    value=0.15,
+    step=0.05
+) / 100
+
 bh_results = []
 for win in window_list:
     start_dt = df["time"].max() - relativedelta(years=win)
@@ -391,21 +408,25 @@ for win in window_list:
         continue
     _, start_price = start_price_row
     end_price = df.iloc[-1]["close"]
+
     qty = 1.0
     gross_value = qty * end_price
     net_value = gross_value * (1 - sell_fee_rate)
+
     total_return_pct = (net_value - (qty * start_price)) / (qty * start_price) * 100
-    annualized_return_pct = ((net_value / (qty * start_price)) ** (1/win) - 1) * 100
+    annualized_return_pct
+    annualized_return_pct = ((net_value / (qty * start_price)) ** (1 / win) - 1) * 100
+
     bh_results.append({
         "Window (tahun)": win,
         "Harga Awal": fmt_idr(start_price),
         "Harga Akhir": fmt_idr(end_price),
         "Nilai Akhir (net)": fmt_idr(net_value),
         "Total Return": fmt_pct(total_return_pct),
-        "CAGR": fmt_pct(annualized
-                "CAGR": fmt_pct(annualized_return_pct)
+        "CAGR": fmt_pct(annualized_return_pct)
     })
 
+# Tampilkan tabel B&H
 st.dataframe(pd.DataFrame(bh_results))
 
 # ---------------------------
@@ -413,7 +434,3 @@ st.dataframe(pd.DataFrame(bh_results))
 # ---------------------------
 st.markdown("---")
 st.caption("DCA BTC/IDR Tokocrypto — Modern Dashboard © 2025")
-
-
-
-
