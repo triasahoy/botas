@@ -1,12 +1,14 @@
-# file: app_dca_tokocrypto.py
-# Streamlit dashboard + real-data backtester (Tokocrypto BTC/IDR) with TradingView-style DCA options
+# file: app_dca_tokocrypto_id_modern_plus.py
+# Streamlit modern dashboard — DCA BTC/IDR (Tokocrypto) dgn format Indonesia, 1D/1H, benchmark fee saat jual, multi-slippage, ekspor ZIP
+# Kredensial diambil dari environment: TOKO_API_KEY, TOKO_SECRET
 
 import os
+import io
 import time
 import math
-import json
+import zipfile
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
@@ -14,22 +16,20 @@ import pytz
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 import ccxt
 import streamlit as st
+from babel.numbers import format_currency, format_decimal
 
 # ---------------------------
-# Logging (console + Streamlit friendliness)
+# Logging
 # ---------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger("DCA-Backtester")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("DCA-ID-Modern-Plus")
 
 # ---------------------------
-# Config dataclasses
+# Konfigurasi
 # ---------------------------
 @dataclass
 class ExchangeConfig:
@@ -43,23 +43,16 @@ class ExchangeConfig:
 
 @dataclass
 class StrategyConfig:
-    # TradingView-style knobs
-    capital_per_trade: float = 5_000_000.0   # fixed IDR per buy
-    fee_rate: float = 0.0015                 # 0.15%
-    fee_in_cost_basis: bool = True           # include fees in avg price
-    buy_mode: str = "monthly"                # "monthly", "weekday", "interval"
-    buy_weekday: int = 0                     # 0=Mon .. 6=Sun (if buy_mode="weekday")
-    interval_candles: int = 30               # every N candles (if buy_mode="interval")
-    price_source: str = "open"               # TV default execution price
-    close_all_on_last_candle: bool = False   # TV "Close All on last candle"
-
-    # Monthly specifics
-    buy_day_of_month: int = 1                # used in monthly mode
-
-    # Execution realism
-    slippage_bps: float = 0.0                # +bps price impact on buy
-
-    # Timezone
+    capital_per_trade: float = 5_000_000.0
+    fee_rate: float = 0.0015
+    fee_in_cost_basis: bool = True
+    buy_mode: str = "monthly"           # "monthly","weekday","interval"
+    buy_weekday: int = 0
+    interval_candles: int = 30
+    price_source: str = "open"          # "open"|"close"
+    close_all_on_last_candle: bool = False
+    buy_day_of_month: int = 1
+    slippage_bps: float = 0.0
     tz_name: str = "Asia/Jakarta"
 
 @dataclass
@@ -84,9 +77,10 @@ class BacktestReport:
     fees_paid_idr: float
     monthly_breakdown: pd.DataFrame
     equity_curve: pd.DataFrame
+    slippage_bps: float = 0.0           # untuk perbandingan skenario
 
 # ---------------------------
-# Utilities
+# Utilitas waktu/format
 # ---------------------------
 def now_jakarta() -> datetime:
     return datetime.now(pytz.timezone("Asia/Jakarta")).replace(microsecond=0)
@@ -97,26 +91,29 @@ def to_ms(dt: datetime) -> int:
 def from_ms(ms: int, tz: str = "Asia/Jakarta") -> datetime:
     return datetime.fromtimestamp(ms / 1000.0, tz=pytz.timezone(tz))
 
-def retryable(func, max_retries=5, backoff=2.0, *args, **kwargs):
-    last_err = None
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff ** attempt)
-    raise last_err
+def fmt_idr(val: float) -> str:
+    try:
+        return format_currency(val, "IDR", locale="id_ID")
+    except Exception:
+        return f"Rp {val:,.0f}".replace(",", ".")
+
+def fmt_dec(val: float, digits: int = 2) -> str:
+    try:
+        fmt = "#,##0." + "0"*digits
+        return format_decimal(val, locale="id_ID", format=fmt)
+    except Exception:
+        return f"{val:,.{digits}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def fmt_pct(val_pct: float, digits: int = 2) -> str:
+    return fmt_dec(val_pct, digits) + "%"
 
 # ---------------------------
-# Exchange client
+# Exchange client (CCXT)
 # ---------------------------
 class ExchangeClient:
     def __init__(self, cfg: ExchangeConfig):
         ex_class = getattr(ccxt, cfg.exchange_id)
-        params = {
-            "enableRateLimit": cfg.enable_rate_limit,
-            "timeout": cfg.timeout,
-        }
+        params = {"enableRateLimit": cfg.enable_rate_limit, "timeout": cfg.timeout}
         self.exchange = ex_class(params)
         if cfg.api_key and cfg.secret:
             self.exchange.apiKey = cfg.api_key
@@ -124,32 +121,34 @@ class ExchangeClient:
         self.max_retries = cfg.max_retries
         self.retry_backoff_sec = cfg.retry_backoff_sec
 
+    def _retry(self, func, *args, **kwargs):
+        last = None
+        for attempt in range(self.max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last = e
+                time.sleep(self.retry_backoff_sec ** attempt)
+        raise last
+
     def load_markets(self) -> Dict[str, Any]:
-        return retryable(self.exchange.load_markets, self.max_retries, self.retry_backoff_sec)
+        return self._retry(self.exchange.load_markets)
 
     def resolve_symbol(self, preferred: List[str]) -> str:
         markets = self.load_markets()
         for s in preferred:
             if s in markets:
                 return s
-        candidates = [m for m in markets.keys() if m.startswith("BTC/") and ("IDR" in m or "IDRT" in m or "BIDR" in m)]
-        if candidates:
-            return candidates[0]
-        raise ValueError("Could not resolve BTC/IDR-like symbol on Tokocrypto.")
+        cands = [m for m in markets if m.startswith("BTC/") and ("IDR" in m or "IDRT" in m or "BIDR" in m)]
+        if cands:
+            return cands[0]
+        raise ValueError("Tidak menemukan simbol BTC/IDR di Tokocrypto.")
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, since_ms: int, until_ms: int, limit: int = 1000) -> List[List[float]]:
         all_rows = []
         cursor = since_ms
         while True:
-            chunk = retryable(
-                self.exchange.fetch_ohlcv,
-                self.max_retries,
-                self.retry_backoff_sec,
-                symbol,
-                timeframe=timeframe,
-                since=cursor,
-                limit=limit,
-            )
+            chunk = self._retry(self.exchange.fetch_ohlcv, symbol, timeframe=timeframe, since=cursor, limit=limit)
             if not chunk:
                 break
             all_rows.extend(chunk)
@@ -157,18 +156,18 @@ class ExchangeClient:
             if last_ts >= until_ms or len(chunk) < limit:
                 break
             cursor = last_ts + 1
-        return [row for row in all_rows if since_ms <= row[0] <= until_ms]
+        return [r for r in all_rows if since_ms <= r[0] <= until_ms]
 
     def fetch_ticker_safe(self, symbols: List[str]) -> Optional[dict]:
-        for sym in symbols:
+        for s in symbols:
             try:
-                return retryable(self.exchange.fetch_ticker, self.max_retries, self.retry_backoff_sec, sym)
+                return self._retry(self.exchange.fetch_ticker, s)
             except Exception:
                 continue
         return None
 
 # ---------------------------
-# Data preparation
+# Data prep
 # ---------------------------
 def ohlcv_to_df(rows: List[List[float]], tz: str = "Asia/Jakarta") -> pd.DataFrame:
     if not rows:
@@ -182,7 +181,7 @@ def ohlcv_to_df(rows: List[List[float]], tz: str = "Asia/Jakarta") -> pd.DataFra
     df = df[(df["close"] > 0) & (df["high"] > 0) & (df["low"] > 0)]
     return df
 
-def first_close_on_or_after(df: pd.DataFrame, target_dt: datetime, price_col: str = "close") -> Optional[Tuple[datetime, float]]:
+def first_price_on_or_after(df: pd.DataFrame, target_dt: datetime, price_col: str = "close") -> Optional[Tuple[datetime, float]]:
     rows = df[df["time"] >= target_dt]
     if rows.empty:
         return None
@@ -190,23 +189,26 @@ def first_close_on_or_after(df: pd.DataFrame, target_dt: datetime, price_col: st
     return row["time"], float(row[price_col])
 
 # ---------------------------
-# Schedule generation
+# Penjadwalan beli
 # ---------------------------
 def generate_monthly_schedule(start_dt: datetime, end_dt: datetime, day_of_month: int) -> List[datetime]:
     schedule = []
     candidate = start_dt.replace(day=1)
-    dm = min(day_of_month, (candidate + relativedelta(months=1) - timedelta(days=1)).day)
+    last_day = (candidate + relativedelta(months=1) - timedelta(days=1)).day
+    dm = min(day_of_month, last_day)
     first_buy = candidate.replace(day=dm, hour=0, minute=0, second=0, microsecond=0)
     if first_buy < start_dt:
         nm = candidate + relativedelta(months=1)
-        dm = min(day_of_month, (nm + relativedelta(months=1) - timedelta(days=1)).day)
+        last_day = (nm + relativedelta(months=1) - timedelta(days=1)).day
+        dm = min(day_of_month, last_day)
         first_buy = nm.replace(day=dm, hour=0, minute=0, second=0, microsecond=0)
-    cur_buy = first_buy
-    while cur_buy <= end_dt:
-        schedule.append(cur_buy)
-        nm = cur_buy + relativedelta(months=1)
-        dm = min(day_of_month, (nm + relativedelta(months=1) - timedelta(days=1)).day)
-        cur_buy = nm.replace(day=dm, hour=0, minute=0, second=0, microsecond=0)
+    cur = first_buy
+    while cur <= end_dt:
+        schedule.append(cur)
+        nm = cur + relativedelta(months=1)
+        last_day = (nm + relativedelta(months=1) - timedelta(days=1)).day
+        dm = min(day_of_month, last_day)
+        cur = nm.replace(day=dm, hour=0, minute=0, second=0, microsecond=0)
     return schedule
 
 def generate_buy_schedule(df: pd.DataFrame, cfg: StrategyConfig) -> List[datetime]:
@@ -215,16 +217,14 @@ def generate_buy_schedule(df: pd.DataFrame, cfg: StrategyConfig) -> List[datetim
     if cfg.buy_mode == "monthly":
         return generate_monthly_schedule(df["time"].min(), df["time"].max(), cfg.buy_day_of_month)
     elif cfg.buy_mode == "weekday":
-        return [t.to_pydatetime() if hasattr(t, "to_pydatetime") else t
-                for t in df["time"].tolist() if t.weekday() == cfg.buy_weekday]
+        return [t.to_pydatetime() if hasattr(t, "to_pydatetime") else t for t in df["time"].tolist() if t.weekday() == cfg.buy_weekday]
     elif cfg.buy_mode == "interval":
-        return [t.to_pydatetime() if hasattr(t, "to_pydatetime") else t
-                for t in df["time"].iloc[::cfg.interval_candles].tolist()]
+        return [t.to_pydatetime() if hasattr(t, "to_pydatetime") else t for t in df["time"].iloc[::cfg.interval_candles].tolist()]
     else:
-        raise ValueError(f"Unknown buy_mode: {cfg.buy_mode}")
+        raise ValueError(f"buy_mode tidak dikenali: {cfg.buy_mode}")
 
 # ---------------------------
-# Risk helpers
+# Risk metrics
 # ---------------------------
 def compute_max_drawdown(equity: pd.Series) -> float:
     if equity.empty:
@@ -253,27 +253,25 @@ def sharpe_from_monthly(returns: pd.Series, rf: float = 0.0) -> Optional[float]:
     return float((mu / sigma) * math.sqrt(12.0))
 
 # ---------------------------
-# Core backtest
+# Backtest inti (DCA)
 # ---------------------------
 def run_dca_backtest(
-    df_daily: pd.DataFrame,
+    df: pd.DataFrame,
     start_dt: datetime,
     end_dt: datetime,
     strat_cfg: StrategyConfig,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float, float, float]:
-    df_win = df_daily[(df_daily["time"] >= start_dt) & (df_daily["time"] <= end_dt)].copy()
+    df_win = df[(df["time"] >= start_dt) & (df["time"] <= end_dt)].copy()
     if df_win.empty:
         return pd.DataFrame(), pd.DataFrame(), 0.0, 0.0, 0.0
 
     schedule = generate_buy_schedule(df_win, strat_cfg)
 
-    records = []
-    cum_btc = 0.0
-    total_cost = 0.0
-    total_fees = 0.0
+    recs = []
+    cum_btc, total_cost, total_fees = 0.0, 0.0, 0.0
 
     for target_dt in schedule:
-        got = first_close_on_or_after(df_win, target_dt, strat_cfg.price_source)
+        got = first_price_on_or_after(df_win, target_dt, strat_cfg.price_source)
         if not got:
             continue
         px_time, px = got
@@ -286,7 +284,7 @@ def run_dca_backtest(
         total_cost += strat_cfg.capital_per_trade
         total_fees += fee
 
-        records.append({
+        recs.append({
             "buy_time": px_time,
             "scheduled_time": target_dt,
             "price_idr": px,
@@ -299,36 +297,58 @@ def run_dca_backtest(
             "cum_fees": total_fees,
         })
 
-    monthly_df = pd.DataFrame(records).sort_values("buy_time").reset_index(drop=True)
+    monthly_df = pd.DataFrame(recs).sort_values("buy_time").reset_index(drop=True)
 
-    df_ec = df_win[["time", "open", "close"]].copy()
-    df_ec["cum_btc"] = 0.0
+    ec = df_win[["time","open","close"]].copy()
+    ec["cum_btc"] = 0.0
     if not monthly_df.empty:
         buys = monthly_df[["buy_time","cum_btc"]].values.tolist()
-        idx = 0
-        cur_cum = 0.0
-        times = df_ec["time"].tolist()
+        idx, cur_cum = 0, 0.0
         cum_vals = []
-        for t in times:
+        for t in ec["time"].tolist():
             while idx < len(buys) and buys[idx][0] <= t:
                 cur_cum = buys[idx][1]
                 idx += 1
             cum_vals.append(cur_cum)
-        df_ec["cum_btc"] = cum_vals
+        ec["cum_btc"] = cum_vals
 
-    if strat_cfg.close_all_on_last_candle and not df_ec.empty:
-        final_price = df_ec[strat_cfg.price_source].iloc[-1]
-        final_value = df_ec["cum_btc"].iloc[-1] * final_price
-        df_ec["equity_idr"] = df_ec["cum_btc"] * df_ec["close"]
-        df_ec.loc[df_ec.index[-1], "cum_btc"] = 0.0
-        df_ec.loc[df_ec.index[-1], "equity_idr"] = final_value
+    if strat_cfg.close_all_on_last_candle and not ec.empty:
+        final_price = ec[strat_cfg.price_source].iloc[-1]
+        final_value = ec["cum_btc"].iloc[-1] * final_price
+        ec["equity_idr"] = ec["cum_btc"] * ec["close"]
+        ec.loc[ec.index[-1], "cum_btc"] = 0.0
+        ec.loc[ec.index[-1], "equity_idr"] = final_value
     else:
-        df_ec["equity_idr"] = df_ec["cum_btc"] * df_ec["close"]
+        ec["equity_idr"] = ec["cum_btc"] * ec["close"]
 
-    return monthly_df, df_ec[["time","close","cum_btc","equity_idr"]].copy(), cum_btc, total_cost, total_fees
+    return monthly_df, ec[["time","close","cum_btc","equity_idr"]].copy(), cum_btc, total_cost, total_fees
 
 # ---------------------------
-# Reporting
+# Benchmark Buy & Hold
+# ---------------------------
+def run_buy_and_hold_benchmark(
+    df: pd.DataFrame,
+    start_dt: datetime,
+    end_dt: datetime,
+    total_invest_idr: float,
+    price_source: str,
+    include_sell_fee: bool,
+    fee_rate: float
+) -> pd.DataFrame:
+    df_win = df[(df["time"] >= start_dt) & (df["time"] <= end_dt)].copy()
+    if df_win.empty:
+        return pd.DataFrame(columns=["time","bh_value_idr"])
+
+    buy_price = float(df_win[price_source].iloc[0])
+    btc_qty = total_invest_idr / buy_price
+    df_win["bh_value_idr"] = btc_qty * df_win["close"]
+    if include_sell_fee:
+        # Terapkan biaya jual hanya pada titik terakhir (realized)
+        df_win.loc[df_win.index[-1], "bh_value_idr"] *= (1.0 - fee_rate)
+    return df_win[["time","bh_value_idr"]].copy()
+
+# ---------------------------
+# Ringkasan & format
 # ---------------------------
 def build_report(
     window_years: int,
@@ -341,7 +361,7 @@ def build_report(
     strat_cfg: StrategyConfig
 ) -> BacktestReport:
     if equity_df.empty:
-        raise ValueError("Equity curve is empty; cannot build report.")
+        raise ValueError("Equity curve kosong.")
 
     start_dt = equity_df["time"].min()
     end_dt = equity_df["time"].max()
@@ -350,10 +370,7 @@ def build_report(
     total_return = (current_value - total_cost) / total_cost if total_cost > 0 else 0.0
 
     if total_btc > 0:
-        if strat_cfg.fee_in_cost_basis:
-            avg_price = total_cost / total_btc
-        else:
-            avg_price = (total_cost - total_fees) / total_btc
+        avg_price = (total_cost / total_btc) if strat_cfg.fee_in_cost_basis else ((total_cost - total_fees) / total_btc)
     else:
         avg_price = 0.0
 
@@ -362,6 +379,26 @@ def build_report(
     mdf = equity_df.copy().set_index("time")
     monthly_equity = mdf["equity_idr"].resample("M").last().dropna()
     monthly_returns = monthly_equity.pct_change().dropna()
+
+    # Annualized & volatility & Sharpe
+    def annualized_return_from_monthly(returns: pd.Series) -> float:
+        if returns.empty:
+            return 0.0
+        prod = (1.0 + returns).prod()
+        years = len(returns) / 12.0
+        if years <= 0:
+            return 0.0
+        return float(prod ** (1.0 / years) - 1.0)
+
+    def sharpe_from_monthly(returns: pd.Series, rf: float = 0.0) -> Optional[float]:
+        if returns.empty:
+            return None
+        excess = returns - rf / 12.0
+        mu = excess.mean()
+        sigma = excess.std(ddof=1)
+        if sigma == 0 or np.isnan(sigma):
+            return None
+        return float((mu / sigma) * math.sqrt(12.0))
 
     ann_return = annualized_return_from_monthly(monthly_returns)
     monthly_vol = monthly_returns.std(ddof=1) if len(monthly_returns) > 1 else 0.0
@@ -384,86 +421,61 @@ def build_report(
         fees_paid_idr=float(total_fees),
         monthly_breakdown=monthly_df,
         equity_curve=equity_df,
+        slippage_bps=float(strat_cfg.slippage_bps),
     )
 
 def summary_table(reports: List[BacktestReport]) -> pd.DataFrame:
     rows = []
     for r in reports:
         rows.append({
-            "WindowYears": r.window_years,
-            "Symbol": r.symbol,
-            "Start": r.start_date,
-            "End": r.end_date,
-            "TotalInvested_IDR": round(r.total_invested_idr, 2),
-            "TotalBTC": round(r.total_btc, 8),
-            "AvgPrice_IDR": round(r.avg_price_idr, 2),
-            "CurrentValue_IDR": round(r.current_value_idr, 2),
-            "TotalReturn_%": round(r.total_return_pct, 2),
-            "AnnualizedReturn_%": round(r.annualized_return_pct, 2),
-            "MaxDrawdown_%": round(r.max_drawdown_pct, 2),
-            "VolatilityMonthly_%": round(r.volatility_monthly_pct, 2),
-            "Sharpe": None if r.sharpe_ratio is None else round(r.sharpe_ratio, 2),
-            "FeesPaid_IDR": round(r.fees_paid_idr, 2),
+            "Periode (tahun)": r.window_years,
+            "Slippage (bps)": r.slippage_bps,
+            "Simbol": r.symbol,
+            "Mulai": r.start_date,
+            "Akhir": r.end_date,
+            "Total Investasi (IDR)": r.total_invested_idr,
+            "Total BTC": r.total_btc,
+            "Harga Rata2 (IDR/BTC)": r.avg_price_idr,
+            "Nilai Saat Ini (IDR)": r.current_value_idr,
+            "Total Return (%)": r.total_return_pct,
+            "Annualized (%)": r.annualized_return_pct,
+            "Max Drawdown (%)": r.max_drawdown_pct,
+            "Volatilitas Bulanan (%)": r.volatility_monthly_pct,
+            "Sharpe": 0.0 if r.sharpe_ratio is None else r.sharpe_ratio,
+            "Total Biaya (IDR)": r.fees_paid_idr,
         })
-    return pd.DataFrame(rows).sort_values("WindowYears")
+    df = pd.DataFrame(rows).sort_values(["Periode (tahun)","Slippage (bps)"])
+    # Format angka Indonesia
+    for col in ["Total Investasi (IDR)", "Harga Rata2 (IDR/BTC)", "Nilai Saat Ini (IDR)", "Total Biaya (IDR)"]:
+        df[col] = df[col].apply(lambda x: fmt_idr(float(x)))
+    df["Total BTC"] = df["Total BTC"].apply(lambda x: fmt_dec(float(x), 8))
+    for col in ["Total Return (%)","Annualized (%)","Max Drawdown (%)","Volatilitas Bulanan (%)"]:
+        df[col] = df[col].apply(lambda x: fmt_dec(float(x), 2) + "%")
+    df["Sharpe"] = df["Sharpe"].apply(lambda x: fmt_dec(float(x), 2))
+    df["Slippage (bps)"] = df["Slippage (bps)"].apply(lambda x: fmt_dec(float(x), 1))
+    return df
 
 # ---------------------------
-# Data orchestration for Streamlit
+# Streamlit UI — Modern
 # ---------------------------
-@st.cache_data(show_spinner=False)
-def fetch_daily_data(symbols_preferred: List[str], years: int, exch_cfg: ExchangeConfig, tz: str) -> Tuple[str, pd.DataFrame]:
-    client = ExchangeClient(exch_cfg)
-    symbol = client.resolve_symbol(symbols_preferred)
-    end_dt = now_jakarta().replace(hour=23, minute=59, second=59)
-    start_dt = end_dt - relativedelta(years=years) - timedelta(days=7)
-    rows = client.fetch_ohlcv(symbol, "1d", to_ms(start_dt), to_ms(end_dt), limit=1000)
-    df_daily = ohlcv_to_df(rows, tz=tz)
-    return symbol, df_daily
+st.set_page_config(page_title="DCA BTC/IDR — Tokocrypto (Modern+)", layout="wide")
 
-@st.cache_data(ttl=20, show_spinner=False)
-def fetch_live_ticker(symbols_preferred: List[str], exch_cfg: ExchangeConfig) -> Optional[dict]:
-    client = ExchangeClient(exch_cfg)
-    return client.fetch_ticker_safe(symbols_preferred)
+# CSS Modern
+st.markdown("""
+<style>
+:root { --card-bg: #0b1020; --card-brd: #1f2a44; --text: #e5e7eb; --muted:#9ca3af; }
+.block-container { padding-top: 1.2rem; }
+.metric-card { background: var(--card-bg); border: 1px solid var(--card-brd); border-radius: 12px; padding: 14px 16px; color: var(--text); }
+.metric-label { font-size: 12px; color: var(--muted); }
+.metric-value { font-size: 20px; font-weight: 700; }
+hr { border: none; border-top: 1px solid rgba(255,255,255,0.08); }
+</style>
+""", unsafe_allow_html=True)
 
-def run_windows_backtests(df_daily: pd.DataFrame, symbol: str, strat_cfg: StrategyConfig, end_dt: datetime, windows: List[int]) -> List[BacktestReport]:
-    reports = []
-    for yrs in windows:
-        start_dt = end_dt - relativedelta(years=yrs)
-        df_win = df_daily[(df_daily["time"] >= start_dt - timedelta(days=7)) & (df_daily["time"] <= end_dt)].copy()
-        monthly_df, equity_df, total_btc, total_cost, total_fees = run_dca_backtest(
-            df_daily=df_win,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            strat_cfg=strat_cfg,
-        )
-        report = build_report(
-            window_years=yrs,
-            symbol=symbol,
-            monthly_df=monthly_df,
-            equity_df=equity_df,
-            total_btc=total_btc,
-            total_cost=total_cost,
-            total_fees=total_fees,
-            strat_cfg=strat_cfg
-        )
-        reports.append(report)
-    return reports
+st.markdown("<h2 style='margin:0 0 6px 0'>✨ DCA BTC/IDR — Tokocrypto (Live, Benchmark, Multi‑Slippage)</h2>", unsafe_allow_html=True)
+st.caption("UI modern • Real‑time • DCA gaya TradingView • 1D / 1H • Benchmark B&H dgn fee jual • Perbandingan slippage • Ekspor ZIP")
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.set_page_config(page_title="BTC/IDR DCA Backtester (Tokocrypto)", layout="wide")
-st.title("📈 BTC/IDR DCA Backtester — Tokocrypto")
-
-# Live price header
-col_lp1, col_lp2, col_lp3 = st.columns(3)
-with col_lp1:
-    st.caption("Live market")
-with col_lp2:
-    st.caption("Updated every ~20s")
-with col_lp3:
-    st.caption(now_jakarta().strftime("%Y-%m-%d %H:%M:%S %Z"))
-
+# Kredensial aman via environment
 exch_cfg = ExchangeConfig(
     api_key=os.getenv("TOKO_API_KEY"),
     secret=os.getenv("TOKO_SECRET"),
@@ -471,153 +483,233 @@ exch_cfg = ExchangeConfig(
 
 preferred_symbols = ["BTC/IDR", "BTC/IDRT", "BTC/BIDR"]
 
-ticker = fetch_live_ticker(preferred_symbols, exch_cfg)
-if ticker:
-    st.metric(
-        label="BTC/IDR Last",
-        value=f"{ticker.get('last', float('nan')):,.0f} IDR",
-        delta=(f"{ticker.get('percentage'):.2f}%" if ticker.get('percentage') is not None else None),
-        help=f"Symbol: {ticker.get('symbol','N/A')}"
-    )
-else:
-    st.info("Unable to fetch live ticker right now.")
+@st.cache_data(ttl=20, show_spinner=False)
+def get_live_ticker() -> Optional[dict]:
+    client = ExchangeClient(exch_cfg)
+    return client.fetch_ticker_safe(preferred_symbols)
 
-st.divider()
+@st.cache_data(show_spinner=False)
+def fetch_data(symbols_preferred: List[str], years: int, timeframe: str, tz: str) -> Tuple[str, pd.DataFrame]:
+    client = ExchangeClient(exch_cfg)
+    symbol = client.resolve_symbol(symbols_preferred)
+    end_dt = now_jakarta()
+    start_dt = end_dt - relativedelta(years=years) - timedelta(days=7)
+    tf_map = {"1D": "1d", "1H": "1h"}
+    tf = tf_map[timeframe]
+    rows = client.fetch_ohlcv(symbol, tf, to_ms(start_dt), to_ms(end_dt), limit=1000)
+    df = ohlcv_to_df(rows, tz=tz)
+    return symbol, df
 
-# Sidebar controls
-st.sidebar.header("Strategy parameters")
+def run_backtests_for_slippages(
+    df_hist: pd.DataFrame,
+    symbol: str,
+    base_cfg: StrategyConfig,
+    end_dt: datetime,
+    years_list: List[int],
+    slippage_scenarios: List[float]
+) -> List[BacktestReport]:
+    reports_all: List[BacktestReport] = []
+    for sbps in slippage_scenarios:
+        cfg = StrategyConfig(**{**base_cfg.__dict__})
+        cfg.slippage_bps = sbps
+        for yrs in years_list:
+            start_dt = end_dt - relativedelta(years=yrs)
+            df_win = df_hist[(df_hist["time"] >= start_dt - timedelta(days=7)) & (df_hist["time"] <= end_dt)].copy()
+            mdf, ecdf, tot_btc, tot_cost, tot_fee = run_dca_backtest(df_win, start_dt, end_dt, cfg)
+            rep = build_report(yrs, symbol, mdf, ecdf, tot_btc, tot_cost, tot_fee, cfg)
+            reports_all.append(rep)
+    return reports_all
 
-buy_mode = st.sidebar.selectbox("Buy mode", ["monthly", "weekday", "interval"], index=0)
-price_source = st.sidebar.selectbox("Execution price", ["open", "close"], index=0)
-fee_in_cost_basis = st.sidebar.checkbox("Include fees in cost basis", True)
-close_all_on_last_candle = st.sidebar.checkbox("Close all on last candle", False)
+def build_benchmarks_for_reports(
+    df_hist: pd.DataFrame,
+    reports: List[BacktestReport],
+    price_source: str,
+    include_sell_fee: bool,
+    fee_rate: float
+) -> Dict[Tuple[int,float], pd.DataFrame]:
+    bh_map: Dict[Tuple[int,float], pd.DataFrame] = {}
+    for rep in reports:
+        n_trades = len(rep.monthly_breakdown)
+        total_invest = n_trades * rep.monthly_breakdown["idr_invested"].mean() if n_trades > 0 else 0.0
+        df_sub = df_hist[(df_hist["time"] >= pd.to_datetime(rep.start_date)) & (df_hist["time"] <= pd.to_datetime(rep.end_date))]
+        bh_df = run_buy_and_hold_benchmark(
+            df=df_sub,
+            start_dt=pd.to_datetime(rep.start_date),
+            end_dt=pd.to_datetime(rep.end_date),
+            total_invest_idr=total_invest,
+            price_source=price_source,
+            include_sell_fee=include_sell_fee,
+            fee_rate=fee_rate
+        )
+        bh_map[(rep.window_years, rep.slippage_bps)] = bh_df
+    return bh_map
 
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    buy_day_of_month = st.number_input("Day of month", min_value=1, max_value=28, value=1, step=1)
-with col2:
-    buy_weekday = st.number_input("Weekday (0=Mon)", min_value=0, max_value=6, value=0, step=1)
+# Live header
+ticker = get_live_ticker()
+cols = st.columns(3)
+with cols[0]:
+    st.markdown("<div class='metric-card'><div class='metric-label'>Harga Live</div>", unsafe_allow_html=True)
+    if ticker:
+        st.markdown(f"<div class='metric-value'>{fmt_idr(float(ticker.get('last', 0)))}</div></div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='metric-value'>-</div></div>", unsafe_allow_html=True)
+with cols[1]:
+    st.markdown("<div class='metric-card'><div class='metric-label'>Symbol</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='metric-value'>{ticker.get('symbol','BTC/IDR') if ticker else 'BTC/IDR'}</div></div>", unsafe_allow_html=True)
+with cols[2]:
+    st.markdown("<div class='metric-card'><div class='metric-label'>Terakhir diperbarui</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='metric-value'>{now_jakarta().strftime('%Y-%m-%d %H:%M:%S %Z')}</div></div>", unsafe_allow_html=True)
 
-interval_candles = st.sidebar.number_input("Interval candles", min_value=1, max_value=365, value=30, step=1)
-capital_per_trade = st.sidebar.number_input("Capital per trade (IDR)", min_value=10000, max_value=100_000_000, value=5_000_000, step=10000)
-fee_rate = st.sidebar.number_input("Fee rate", min_value=0.0, max_value=0.01, value=0.0015, step=0.0001, format="%.4f")
-slippage_bps = st.sidebar.number_input("Slippage (bps)", min_value=0.0, max_value=100.0, value=0.0, step=0.1)
+st.markdown("<hr>", unsafe_allow_html=True)
 
-windows_sel = st.sidebar.multiselect("Backtest windows (years)", [1, 3, 5], default=[1, 3, 5])
+# Sidebar — kontrol
+st.sidebar.header("🧭 Parameter Data")
+timeframe = st.sidebar.radio("Timeframe", ["1D","1H"], index=0, horizontal=True)
+hist_years_fetch = st.sidebar.selectbox("Rentang historis (fetch)", [1,3,5], index=2)
+refresh_data = st.sidebar.button("🔄 Muat ulang data")
 
-st.sidebar.header("Data controls")
-hist_years_fetch = st.sidebar.selectbox("Historical fetch range", [1, 3, 5], index=2)
-refresh_data = st.sidebar.button("Refresh historical data")
+st.sidebar.header("⚙️ Strategi DCA")
+buy_mode = st.sidebar.selectbox("Mode Beli", ["monthly","weekday","interval"], index=0)
+price_source = st.sidebar.selectbox("Harga Eksekusi", ["open","close"], index=0)
+fee_in_cost_basis = st.sidebar.checkbox("Biaya termasuk dalam harga rata-rata", True)
+close_all = st.sidebar.checkbox("Close All pada candle terakhir (realized)", False)
+c1, c2 = st.sidebar.columns(2)
+with c1:
+    buy_day_of_month = st.number_input("Tanggal beli (bulanan)", 1, 28, 1)
+with c2:
+    buy_weekday = st.number_input("Hari (0=Senin)", 0, 6, 0)
+interval_candles = st.sidebar.number_input("Interval (N candle)", 1, 365, 30)
+capital_per_trade = st.sidebar.number_input("Modal per beli (IDR)", 10_000, 100_000_000, 5_000_000, step=10_000)
+fee_rate_pct = st.sidebar.number_input("Biaya (%)", 0.00, 1.00, 0.15, step=0.01)
+windows_sel = st.sidebar.multiselect("Periode backtest (tahun)", [1,3,5], default=[1,3,5])
 
-# Build strategy config
-strat_cfg = StrategyConfig(
+st.sidebar.header("🧪 Skenario Slippage")
+slip_options = st.sidebar.multiselect("Pilih slippage (bps)", [0.0, 5.0, 10.0, 20.0], default=[0.0, 5.0, 10.0])
+
+st.sidebar.header("📏 Benchmark B&H")
+bench_fee_sell = st.sidebar.checkbox("Benchmark: Terapkan biaya saat jual akhir", True)
+
+auto_refresh = st.sidebar.checkbox("Auto-refresh harga (20 detik)", value=True)
+
+# StrategyConfig dasar
+base_cfg = StrategyConfig(
     capital_per_trade=float(capital_per_trade),
-    fee_rate=float(fee_rate),
+    fee_rate=float(fee_rate_pct)/100.0,
     fee_in_cost_basis=fee_in_cost_basis,
     buy_mode=buy_mode,
     buy_day_of_month=int(buy_day_of_month),
     buy_weekday=int(buy_weekday),
     interval_candles=int(interval_candles),
     price_source=price_source,
-    close_all_on_last_candle=close_all_on_last_candle,
-    slippage_bps=float(slippage_bps),
-    tz_name="Asia/Jakarta",
+    close_all_on_last_candle=close_all,
+    slippage_bps=0.0,  # di-override per skenario
+    tz_name="Asia/Jakarta"
 )
 
-# Historical data fetch (cached)
-if refresh_data or "hist_data_key" not in st.session_state or st.session_state.get("hist_data_years") != hist_years_fetch:
+# Fetch historical
+if refresh_data or "hist_key" not in st.session_state or st.session_state.get("hist_sig") != (hist_years_fetch, timeframe):
     try:
-        symbol, df_daily = fetch_daily_data(preferred_symbols, hist_years_fetch, exch_cfg, strat_cfg.tz_name)
-        st.session_state["hist_data_key"] = f"{symbol}_{hist_years_fetch}"
-        st.session_state["hist_data_years"] = hist_years_fetch
+        symbol, df_hist = fetch_data(preferred_symbols, hist_years_fetch, timeframe, base_cfg.tz_name)
+        st.session_state["hist_key"] = f"{symbol}_{hist_years_fetch}_{timeframe}"
+        st.session_state["hist_sig"] = (hist_years_fetch, timeframe)
         st.session_state["symbol"] = symbol
-        st.session_state["df_daily"] = df_daily
-        st.success(f"Historical data loaded for {symbol} ({hist_years_fetch}y).")
+        st.session_state["df_hist"] = df_hist
+        st.success(f"Data historis termuat: {symbol} ({hist_years_fetch} tahun, {timeframe}).")
     except Exception as e:
-        st.error(f"Failed to load historical data: {e}")
+        st.error(f"Gagal memuat data historis: {e}")
 
 symbol = st.session_state.get("symbol")
-df_daily = st.session_state.get("df_daily")
+df_hist = st.session_state.get("df_hist")
 
-run_bt = st.button("Run backtests")
+col_actions = st.columns([1,1,2,2])
+with col_actions[0]:
+    run_bt = st.button("▶️ Jalankan Backtest")
+with col_actions[1]:
+    clear_bt = st.button("🧹 Bersihkan")
+
+if clear_bt:
+    st.session_state.pop("reports", None)
+    st.session_state.pop("bh_bench", None)
+
 if run_bt:
-    if df_daily is None or df_daily.empty or symbol is None:
-        st.error("Historical data not available. Load data first.")
+    if df_hist is None or df_hist.empty or symbol is None:
+        st.error("Data historis belum tersedia. Muat data terlebih dahulu.")
     else:
-        with st.spinner("Running backtests..."):
-            end_dt = now_jakarta().replace(hour=23, minute=59, second=59)
-            try:
-                reports = run_windows_backtests(df_daily, symbol, strat_cfg, end_dt, windows_sel)
-                st.session_state["reports"] = reports
-                st.success("Backtests completed.")
-            except Exception as e:
-                st.error(f"Backtest error: {e}")
+        with st.spinner("Menjalankan backtest & skenario slippage..."):
+            end_dt = now_jakarta()
+            reports_all = run_backtests_for_slippages(
+                df_hist=df_hist,
+                symbol=symbol,
+                base_cfg=base_cfg,
+                end_dt=end_dt,
+                years_list=windows_sel,
+                slippage_scenarios=slip_options
+            )
+            bh_map = build_benchmarks_for_reports(
+                df_hist=df_hist,
+                reports=reports_all,
+                price_source=price_source,
+                include_sell_fee=bench_fee_sell,
+                fee_rate=base_cfg.fee_rate
+            )
+            st.session_state["reports"] = reports_all
+            st.session_state["bh_bench"] = bh_map
+        st.success("Selesai.")
 
 reports: List[BacktestReport] = st.session_state.get("reports", [])
+bh_bench: Dict[Tuple[int,float], pd.DataFrame] = st.session_state.get("bh_bench", {})
 
-# Render results
+# Hasil
 if reports:
-    st.subheader("Summary metrics")
-    df_summary = summary_table(reports)
-    st.dataframe(df_summary, use_container_width=True)
+    st.subheader("📊 Ringkasan Kinerja (Format Indonesia)")
+    df_sum = summary_table(reports)
+    st.dataframe(df_sum, use_container_width=True)
 
-    # Download button for summary
-    st.download_button(
-        label="Download summary CSV",
-        data=df_summary.to_csv(index=False).encode("utf-8"),
-        file_name="summary_all_windows.csv",
-        mime="text/csv"
-    )
+    # Tabs per periode — each tab overlay multiple slippage curves
+    for yrs in sorted(set(r.window_years for r in reports)):
+        st.markdown(f"### {yrs} Tahun — Perbandingan Slippage")
+        # Filter reports for this window
+        subset = [r for r in reports if r.window_years == yrs]
+        # Grafik equity overlay
+        fig = go.Figure()
+        for r in subset:
+            eq = r.equity_curve.copy()
+            fig.add_trace(go.Scatter(x=eq["time"], y=eq["equity_idr"], mode="lines",
+                                     name=f"DCA s={r.slippage_bps:.1f}bps", line=dict(width=2)))
+            # Benchmark for this slippage key
+            bh_key = (r.window_years, r.slippage_bps)
+            if bh_key in bh_bench and not bh_bench[bh_key].empty:
+                fig.add_trace(go.Scatter(x=bh_bench[bh_key]["time"], y=bh_bench[bh_key]["bh_value_idr"], mode="lines",
+                                         name=f"B&H s={r.slippage_bps:.1f}bps", line=dict(width=2, dash="dash")))
+        fig.update_layout(template="plotly_dark", height=420, margin=dict(l=10,r=10,t=30,b=10),
+                          title=f"Equity Curve — {yrs} Tahun (Multi‑Slippage)", xaxis_title="Tanggal", yaxis_title="IDR")
+        st.plotly_chart(fig, use_container_width=True)
 
-    # Tabs per window
-    tabs = st.tabs([f"{r.window_years}y" for r in reports])
-    for tab, rep in zip(tabs, reports):
-        with tab:
-            colA, colB, colC = st.columns(3)
-            colA.metric("Total invested (IDR)", f"{rep.total_invested_idr:,.0f}")
-            colB.metric("Total BTC", f"{rep.total_btc:.8f}")
-            colC.metric("Avg price (IDR/BTC)", f"{rep.avg_price_idr:,.0f}")
+        # Tabel ringkas per slippage (subset)
+        df_subset = summary_table(subset)
+        st.dataframe(df_subset, use_container_width=True)
 
-            colD, colE, colF = st.columns(3)
-            colD.metric("Current value (IDR)", f"{rep.current_value_idr:,.0f}")
-            colE.metric("Total return (%)", f"{rep.total_return_pct:.2f}%")
-            colF.metric("Annualized (%)", f"{rep.annualized_return_pct:.2f}%")
-
-            colG, colH, colI = st.columns(3)
-            colG.metric("Max drawdown (%)", f"{rep.max_drawdown_pct:.2f}%")
-            colH.metric("Volatility monthly (%)", f"{rep.volatility_monthly_pct:.2f}%")
-            colI.metric("Sharpe", f"{0.0 if rep.sharpe_ratio is None else rep.sharpe_ratio:.2f}")
-
-            # Charts
-            st.markdown("**Equity curve (IDR)**")
-            eq_df = rep.equity_curve.copy().set_index("time")[["equity_idr"]]
-            st.line_chart(eq_df)
-
-            st.markdown("**Cumulative BTC**")
-            btc_df = rep.equity_curve.copy().set_index("time")[["cum_btc"]]
-            st.line_chart(btc_df)
-
-            # Monthly breakdown table with download
-            st.markdown("**Monthly breakdown**")
-            mb = rep.monthly_breakdown.copy()
-            mb["buy_time"] = pd.to_datetime(mb["buy_time"]).dt.strftime("%Y-%m-%d")
-            mb["scheduled_time"] = pd.to_datetime(mb["scheduled_time"]).dt.strftime("%Y-%m-%d")
-            st.dataframe(mb, use_container_width=True, height=300)
-            st.download_button(
-                label=f"Download monthly breakdown ({rep.window_years}y)",
-                data=mb.to_csv(index=False).encode("utf-8"),
-                file_name=f"monthly_breakdown_{rep.window_years}y.csv",
-                mime="text/csv"
-            )
-
-# Gentle auto-refresh for live price
-st.caption("Auto-refreshing live price...")
-st.experimental_rerun  # no-op reference to avoid lint complaints
-st_autorefresh = st.sidebar.checkbox("Auto-refresh live price (20s)", value=True)
-if st_autorefresh:
-    st.experimental_set_query_params(_=int(time.time()))  # bust cache occasionally
-    st.experimental_singleton.clear()  # safe-ish in this small app
-    st.cache_data.clear()              # refresh cached ticker
-    st.experimental_memo.clear()       # legacy safety
-    st.toast("Refreshing live price...", icon="🔄")
-    time.sleep(0.1)
+    # Ekspor ZIP seluruh skenario
+    st.subheader("📦 Ekspor Hasil (ZIP, semua skenario)")
+    if st.button("Buat & Unduh ZIP"):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+            # Summary raw CSV (tanpa formatting)
+            df_raw = pd.DataFrame([{
+                "window_years": r.window_years,
+                "slippage_bps": r.slippage_bps,
+                "symbol": r.symbol,
+                "start": r.start_date,
+                "end": r.end_date,
+                "total_invested_idr": r.total_invested_idr,
+                "total_btc": r.total_btc,
+                "avg_price_idr": r.avg_price_idr,
+                "current_value_idr": r.current_value_idr,
+                "total_return_pct": r.total_return_pct,
+                "annualized_return_pct": r.annualized_return_pct,
+                "max_drawdown_pct": r.max_drawdown_pct,
+                "volatility_monthly_pct": r.volatility_monthly_pct,
+                "sharpe_ratio": 0.0 if r.sharpe_ratio is None else r.sharpe_ratio,
+                "fees_paid_idr": r.fees_paid_idr
+            } for r in reports]).sort_values(["window_years","slippage_bps"])
+            z.writestr("summary_all_windows_raw.csv", df_raw.to_csv
