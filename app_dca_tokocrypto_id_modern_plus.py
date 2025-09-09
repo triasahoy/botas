@@ -311,6 +311,7 @@ for slip in slippage_list:
 
 # Tabel hasil ringkas
 st.subheader("📊 Ringkasan Hasil Backtest")
+
 summary_data = []
 for r in reports:
     summary_data.append({
@@ -325,6 +326,7 @@ for r in reports:
         "Fee Dibayar": fmt_idr(r.fees_paid_idr)
     })
 
+# Tampilkan tabel ringkasan
 st.dataframe(pd.DataFrame(summary_data))
 
 # Grafik Equity Curve
@@ -410,5 +412,6 @@ st.dataframe(pd.DataFrame(bh_results))
 # ---------------------------
 st.markdown("---")
 st.caption("DCA BTC/IDR Tokocrypto — Modern Dashboard © 2025")
+
 
 
