@@ -198,4 +198,6 @@ def generate_monthly_schedule(start_dt: datetime, end_dt: datetime, day_of_month
         nm = candidate + relativedelta(months=1)
         last_day = (nm + relativedelta(months=1) - timedelta(days=1)).day
         dm = min(day_of_month, last_day)
-        first_buy = nm.replace(day=dm, hour=0, minute=0, second=0, microsecond=
+        first_buy = nm.replace(day=dm, hour=0, minute=0, second=0, microsecond=0)
+    cur = first_buy
+    while cur <= end
