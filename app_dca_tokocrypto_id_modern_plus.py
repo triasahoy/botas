@@ -199,7 +199,7 @@ def run_dca_backtest(df: pd.DataFrame, cfg: StrategyConfig, window_years: int) -
     schedule = generate_monthly_schedule(start_dt, end_dt, cfg.buy_day_of_month)
     total_invested = 0.0
     total_btc
-        total_btc = 0.0
+    total_btc = 0.0
     fees_paid = 0.0
     equity_curve = []
     monthly_breakdown = []
@@ -409,3 +409,4 @@ st.dataframe(pd.DataFrame(bh_results))
 # ---------------------------
 st.markdown("---")
 st.caption("DCA BTC/IDR Tokocrypto — Modern Dashboard © 2025")
+
