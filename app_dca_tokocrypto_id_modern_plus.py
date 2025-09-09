@@ -243,20 +243,25 @@ def run_dca_backtest(df: pd.DataFrame, cfg: StrategyConfig, window_years: int) -
     eq_df = pd.DataFrame(equity_curve)
     mb_df = pd.DataFrame(monthly_breakdown)
 
-    return BacktestReport(
-        window_years=window_years,
-        symbol="BTC/IDR",
-        start_date=start_dt.strftime("%Y-%m-%d"),
-        end_date=end_dt.strftime("%Y-%m-%d"),
-        total
-        bh_results.append({
-        "Window (tahun)": win,
-        "Harga Awal": fmt_idr(start_price),
-        "Harga Akhir": fmt_idr(end_price),
-        "Nilai Akhir (net)": fmt_idr(net_value),
-        "Total Return": fmt_pct(total_return_pct),
-        "CAGR": fmt_pct(annualized_return_pct)
-    })
+return BacktestReport(
+    window_years=window_years,
+    symbol="BTC/IDR",
+    start_date=start_dt.strftime("%Y-%m-%d"),
+    end_date=end_dt.strftime("%Y-%m-%d"),
+    total_invested_idr=total_invested,
+    total_btc=total_btc,
+    avg_price_idr=total_invested / total_btc if total_btc > 0 else 0,
+    current_value_idr=current_value,
+    total_return_pct=total_return_pct,
+    annualized_return_pct=annualized_return_pct,
+    max_drawdown_pct=0.0,
+    volatility_monthly_pct=0.0,
+    sharpe_ratio=None,
+    fees_paid_idr=fees_paid,
+    monthly_breakdown=mb_df,
+    equity_curve=eq_df,
+    slippage_bps=cfg.slippage_bps
+)
 
 # Tampilkan tabel B&H
 st.dataframe(pd.DataFrame(bh_results))
@@ -266,3 +271,4 @@ st.dataframe(pd.DataFrame(bh_results))
 # ---------------------------
 st.markdown("---")
 st.caption("DCA BTC/IDR Tokocrypto — Modern Dashboard © 2025")
+
