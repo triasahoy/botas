@@ -1,12 +1,23 @@
-# DCA BTC/IDR Tokocrypto — Modern Streamlit App
+# 📈 DCA BTC/IDR Tokocrypto — Modern Dashboard
 
-Aplikasi Streamlit untuk backtest strategi DCA gaya TradingView pada pasangan BTC/IDR di Tokocrypto, dengan:
-- Multi-slippage scenario
-- Benchmark Buy & Hold dengan opsi biaya jual
-- Format angka Indonesia
-- Ekspor hasil ke ZIP
+Dashboard interaktif berbasis **Streamlit** untuk menganalisis strategi **Dollar Cost Averaging (DCA)** pada pasangan **BTC/IDR** menggunakan data dari **Tokocrypto** (via CCXT).  
+Mendukung multi‑slippage, perhitungan biaya transaksi, benchmark Buy & Hold, ekspor hasil ke ZIP, dan tampilan grafik equity curve yang modern.
 
-## Cara Jalankan Lokal
-```bash
-pip install -r requirements.txt
-streamlit run app_dca_tokocrypto_id_modern_plus.py
+---
+
+## ✨ Fitur Utama
+- **Multi‑slippage backtest**: uji performa DCA dengan berbagai asumsi slippage (bps).
+- **Benchmark Buy & Hold**: bandingkan hasil DCA dengan strategi beli‑tahan.
+- **Ekspor ZIP**: simpan hasil backtest (summary, breakdown, equity curve) dalam satu file ZIP.
+- **Format Indonesia**: angka dan mata uang otomatis diformat sesuai lokal.
+- **Auto‑refresh harga**: update harga BTC/IDR setiap 60 detik.
+- **UI modern**: grafik interaktif dengan Plotly.
+
+---
+
+## 📦 Instalasi Lokal
+
+1. **Clone repo**
+   ```bash
+   git clone https://github.com/username/repo-name.git
+   cd repo-name
