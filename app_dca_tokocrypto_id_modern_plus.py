@@ -324,6 +324,7 @@ for r in reports:
         "CAGR": fmt_pct(r.annualized_return_pct),
         "Fee Dibayar": fmt_idr(r.fees_paid_idr)
     })
+
 st.dataframe(pd.DataFrame(summary_data))
 
 # Grafik Equity Curve
@@ -409,4 +410,5 @@ st.dataframe(pd.DataFrame(bh_results))
 # ---------------------------
 st.markdown("---")
 st.caption("DCA BTC/IDR Tokocrypto — Modern Dashboard © 2025")
+
 
