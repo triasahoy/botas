@@ -170,7 +170,6 @@ def first_price_on_or_after(df: pd.DataFrame, target_dt: datetime, price_col: st
     row = rows.iloc[0]
     return row["time"], float(row[price_col])
 
-# Penjadwalan beli
 def generate_monthly_schedule(start_dt: datetime, end_dt: datetime, day_of_month: int) -> List[datetime]:
     schedule = []
     candidate = start_dt.replace(day=1)
@@ -195,10 +194,8 @@ def generate_monthly_schedule(start_dt: datetime, end_dt: datetime, day_of_month
 def run_dca_backtest(df: pd.DataFrame, cfg: StrategyConfig, window_years: int) -> BacktestReport:
     end_dt = df["time"].max()
     start_dt = end_dt - relativedelta(years=window_years)
-    df_window = df[df["time"] >= start_dt].reset
-        df_window = df[df["time"] >= start_dt].reset_index(drop=True)
+    df_window = df[df["time"] >= start_dt].reset_index(drop=True)
     schedule = generate_monthly_schedule(start_dt, end_dt, cfg.buy_day_of_month)
-
     total_invested = 0.0
     total_btc = 0.0
     fees_paid = 0.0
@@ -229,7 +226,7 @@ def run_dca_backtest(df: pd.DataFrame, cfg: StrategyConfig, window_years: int) -
     current_value = total_btc * current_price
     total_return_pct = (current_value - total_invested) / total_invested * 100
     years = window_years
-    annualized_return_pct = ((current_value / total_invested) ** (1/years) - 1) * 100 if total_invested > 0 else 0
+    annualized_return_pct = ((current_value / total_invested) ** (1 / years) - 1) * 100 if total_invested > 0 else 0
 
     # Equity curve
     running_btc = 0.0
@@ -251,173 +248,8 @@ def run_dca_backtest(df: pd.DataFrame, cfg: StrategyConfig, window_years: int) -
         symbol="BTC/IDR",
         start_date=start_dt.strftime("%Y-%m-%d"),
         end_date=end_dt.strftime("%Y-%m-%d"),
-        total_invested_idr=total_invested,
-        total_btc=total_btc,
-        avg_price_idr=total_invested / total_btc if total_btc > 0 else 0,
-        current_value_idr=current_value,
-        total_return_pct=total_return_pct,
-        annualized_return_pct=annualized_return_pct,
-        max_drawdown_pct=0.0,
-        volatility_monthly_pct=0.0,
-        sharpe_ratio=None,
-        fees_paid_idr=fees_paid,
-        monthly_breakdown=mb_df,
-        equity_curve=eq_df,
-        slippage_bps=cfg.slippage_bps
-    )
-
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.set_page_config(page_title="DCA BTC/IDR Tokocrypto — Modern", layout="wide")
-st.title("📈 DCA BTC/IDR Tokocrypto — Modern Dashboard")
-
-# Auto-refresh harga setiap 60 detik
-st_autorefresh(interval=60 * 1000, key="refresh_price")
-
-# Ambil kredensial dari environment
-api_key = os.getenv("TOKO_API_KEY")
-api_secret = os.getenv("TOKO_SECRET")
-
-cfg_ex = ExchangeConfig(api_key=api_key, secret=api_secret)
-client = ExchangeClient(cfg_ex)
-
-symbol = client.resolve_symbol(["BTC/IDR", "BTC/IDRT", "BTC/BIDR"])
-ticker = client.fetch_ticker_safe([symbol])
-if ticker:
-    st.metric("Harga BTC/IDR", fmt_idr(ticker["last"]))
-else:
-    st.warning("Gagal mengambil harga BTC/IDR")
-
-# Ambil data OHLCV
-end_dt = now_jakarta()
-start_dt = end_dt - relativedelta(years=5)
-ohlcv = client.fetch_ohlcv(symbol, "1d", to_ms(start_dt), to_ms(end_dt))
-df = ohlcv_to_df(ohlcv)
-
-# ---------------------------
-# Multi-slippage backtest
-# ---------------------------
-slippage_list = [0.0, 5.0, 10.0]
-window_list = [1, 3, 5]
-
-reports = []
-for slip in slippage_list:
-    for win in window_list:
-        cfg_strat = StrategyConfig(
-            capital_per_trade=5_000_000.0,
-            fee_rate=0.0015,
-            buy_day_of_month=1,
-            slippage_bps=slip
-        )
-        rep = run_dca_backtest(df, cfg_strat, win)
-        reports.append(rep)
-
-# ---------------------------
-# Tabel hasil ringkasan
-# ---------------------------
-st.subheader("📊 Ringkasan Hasil Backtest")
-
-summary_data = []
-for r in reports:
-    summary_data.append({
-        "Window (tahun)": r.window_years,
-        "Slippage (bps)": r.slippage_bps,
-        "Total Investasi": fmt_idr(r.total_invested_idr),
-        "Total BTC": fmt_dec(r.total_btc, 6),
-        "Harga Rata-rata": fmt_idr(r.avg_price_idr),
-        "Nilai Sekarang": fmt_idr(r.current_value_idr),
-        "Total Return": fmt_pct(r.total_return_pct),
-        "CAGR": fmt_pct(r.annualized_return_pct),
-        "Fee Dibayar": fmt_idr(r.fees_paid_idr)
-    })
-
-st.dataframe(pd.DataFrame(summary_data))
-
-# ---------------------------
-# Grafik Equity Curve
-# ---------------------------
-st.subheader("📈 Grafik Equity Curve")
-fig = go.Figure()
-for r in reports:
-    fig.add_trace(go.Scatter(
-        x=r.equity_curve["time"],
-        y=r.equity_curve["equity_idr"],
-        mode="lines",
-        name=f"{r.window_years}y — slip {r.slippage_bps}bps"
-    ))
-fig.update_layout(template="plotly_dark", height=500, width=900)
-st.plotly_chart(fig, use_container_width=True)
-
-# ---------------------------
-# Ekspor ZIP
-# ---------------------------
-st.subheader("📦 Ekspor Hasil (ZIP)")
-if st.button("Buat & Unduh ZIP"):
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
-        df_raw = pd.DataFrame([{
-            "window_years": r.window_years,
-            "slippage_bps": r.slippage_bps,
-            "symbol": r.symbol,
-            "start": r.start_date,
-            "end": r.end_date,
-            "total_invested_idr": r.total_invested_idr,
-            "total_btc": r.total_btc,
-            "avg_price_idr": r.avg_price_idr,
-            "current_value_idr": r.current_value_idr,
-            "total_return_pct": r.total_return_pct,
-            "annualized_return_pct": r.annualized_return_pct,
-            "fees_paid_idr": r.fees_paid_idr
-        } for r in reports])
-        z.writestr("summary_all_windows_raw.csv", df_raw.to_csv(index=False))
-        for r in reports:
-            z.writestr(
-                f"{r.window_years}y_slip{r.slippage_bps:.1f}bps_monthly_breakdown.csv",
-                r.monthly_breakdown.to_csv(index=False)
-            )
-            z.writestr(
-                f"{r.window_years}y_slip{r.slippage_bps:.1f}bps_equity_curve.csv",
-                r.equity_curve.to_csv(index=False)
-            )
-    buffer.seek(0)
-    st.download_button(
-        label="⬇️ Unduh ZIP",
-        data=buffer,
-        file_name="dca_tokocrypto_results.zip",
-        mime="application/zip"
-    )
-
-# ---------------------------
-# Benchmark Buy & Hold
-# ---------------------------
-st.subheader("📏 Benchmark Buy & Hold")
-sell_fee_rate = st.number_input(
-    "Biaya jual (%)",
-    min_value=0.0,
-    max_value=5.0,
-    value=0.15,
-    step=0.05
-) / 100
-
-bh_results = []
-for win in window_list:
-    start_dt = df["time"].max() - relativedelta(years=win)
-    start_price_row = first_price_on_or_after(df, start_dt, "open")
-    if not start_price_row:
-        continue
-    _, start_price = start_price_row
-    end_price = df.iloc[-1]["close"]
-
-    qty = 1.0
-    gross_value = qty * end_price
-    net_value = gross_value * (1 - sell_fee_rate)
-
-    total_return_pct = (net_value - (qty * start_price)) / (qty * start_price) * 100
-    annualized_return_pct
-    annualized_return_pct = ((net_value / (qty * start_price)) ** (1 / win) - 1) * 100
-
-    bh_results.append({
+        total
+        bh_results.append({
         "Window (tahun)": win,
         "Harga Awal": fmt_idr(start_price),
         "Harga Akhir": fmt_idr(end_price),
