@@ -1,0 +1,10 @@
+streamlit
+streamlit-autorefresh
+ccxt
+pandas
+numpy
+plotly
+python-dateutil
+pytz
+Babel
+kaleido
